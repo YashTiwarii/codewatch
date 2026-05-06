@@ -1,0 +1,30 @@
+thresholds:
+  cyclomatic_complexity: 10   # McCabe 1976 original recommendation
+  function_lines: 50          # Fowler "Refactoring" p.73
+  class_lines: 300            # Lanza & Marinescu 2006
+  class_methods: 20           # Lanza & Marinescu 2006
+  parameters: 4               # Fowler "Refactoring" p.88
+  nesting_depth: 3            # empirical
+  efferent_coupling: 10       # Martin "Clean Code"
+  lcom: 0.8                   # LCOM-HS; 0.8 = high incoherence signal
+  duplicate_similarity: 0.85  # cosine similarity cliff for DUPLICATE_LOGIC
+
+graph:
+  blast_radius_depth: 3
+
+ai:
+  provider: "gemini"              # anthropic | openai | ollama | gemini
+  model: "gemini-2.5-flash-lite"
+  api_key_env: "GEMINI_API_KEY"
+
+semantic:
+  embedding_model: "all-MiniLM-L6-v2"
+  embedding_model_sha: ""         # pin to HuggingFace commit SHA for CI
+
+dead_code:
+  enabled: false                  # opt-in — too many false positives by default
+
+custom_rules: []
+  # Examples:
+  # - "controllers/* must not import from repositories/*"
+  # - "no import from api/* to db/*"
