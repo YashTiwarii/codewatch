@@ -1,51 +1,45 @@
 # codewatch
 
 Structural code quality guardrail for Python. Combines AST parsing, dependency
-graph analysis, and AI explanations to detect code quality violations — and
-blocks your CI pipeline when it finds them.
+graph analysis, and AI explanations to detect code quality violations, blocking
+your CI pipeline when it finds them.
 
 The core philosophy: guardrails only work when they are **immediate, automatic,
-and in the critical path**. codewatch is not a reporting tool — it is a
+and in the critical path**. codewatch is not a reporting tool; it is a
 pipeline-blocking guardrail that makes the cost of bad structure visible at the
 moment it is introduced, not months later when the blast radius has compounded.
-
----
 
 ## Why codewatch
 
 Most code quality tools fracture the feedback loop. The person who writes bad
 structure is not the person who pays the price, and not at the time they wrote
-it. codewatch tightens that loop — detection is immediate, local, free, and in
+it. codewatch tightens that loop so detection is immediate, local, free, and in
 the commit path.
 
 **Structural detection is always deterministic.** Same input always produces
 identical findings regardless of API availability or model version. AI only
-explains — it never detects.
-
----
+explains; it never detects.
 
 ## Architecture
 
 ```
 cli.py
-  → parse.py      deterministic · radon + stdlib ast
-  → graph.py      deterministic · networkx dependency graph
-  → rules.py      deterministic · zero AI
-  → semantic.py   reproducible  · local embeddings (optional)
-  → review.py     AI called exactly once · explanations only
+  -> parse.py      deterministic · radon + stdlib ast
+  -> graph.py      deterministic · networkx dependency graph
+  -> rules.py      deterministic · zero AI
+  -> semantic.py   reproducible  · local embeddings (optional)
+  -> review.py     AI called exactly once · explanations only
 ```
 
 Each stage is independently runnable and testable without the AI layer.
 If the AI provider is unavailable, findings and health score are always
-returned — exit code reflects finding severity, never AI availability.
-
----
+returned. Exit code reflects finding severity, never AI availability.
 
 ## Detected rules
 
 | Rule | Severity | Description |
 |---|---|---|
-| `GOD_CLASS` | high | Class with high methods + lines + coupling + low cohesion |
+| `GOD_CLASS` | high | Class with high methods, lines, coupling, and low cohesion |
 | `HIGH_COMPLEXITY` | high | Cyclomatic complexity above threshold |
 | `HIGH_COUPLING` | high | Class with too many external dependencies |
 | `ARCH_VIOLATION` | high | Import violates a custom architectural rule |
@@ -59,14 +53,12 @@ returned — exit code reflects finding severity, never AI availability.
 | `LONG_PARAM_LIST` | low | Too many function parameters |
 | `DEAD_CODE` | low | Internal function with no callers (opt-in) |
 
----
-
 ## Install
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# Add your AI provider key to .env
+# Add your Gemini API key to .env
 ```
 
 ### For duplicate detection (optional)
@@ -74,8 +66,6 @@ cp .env.example .env
 ```bash
 pip install sentence-transformers sqlite-vec
 ```
-
----
 
 ## Quick start
 
@@ -90,41 +80,61 @@ codewatch review pr changes.diff
 codewatch review repo .
 ```
 
-### Example output
+### Output against this repository
 
 ```
 codewatch · repo mode · 9 files analysed
 
-FINDINGS (6)
+FINDINGS (26)
 ────────────────────────────────────────────────────────────
-[HIGH]    HIGH_COMPLEXITY    _resolve_imports    codewatch/parse.py
+[HIGH]    HIGH_COMPLEXITY    _run                    codewatch/cli.py
+         metric=14  threshold=10
+
+[HIGH]    HIGH_COMPLEXITY    _resolve_imports        codewatch/parse.py
          metric=15  threshold=10
          blast radius: 1 file
 
-[HIGH]    GOD_CLASS          UserService         services/user.py
-         metric=0.91  threshold=0.80
-         blast radius: 8 files
+[HIGH]    HIGH_COMPLEXITY    _build_user_prompt      codewatch/review.py
+         metric=12  threshold=10
+         blast radius: 1 file
 
-[MEDIUM]  LONG_FUNCTION      _check_classes      codewatch/rules.py
+[HIGH]    HIGH_COMPLEXITY    _parse_ai_response      codewatch/review.py
+         metric=13  threshold=10
+         blast radius: 1 file
+
+[MEDIUM]  LONG_FUNCTION      _build_user_prompt      codewatch/review.py
+         metric=125  threshold=50
+         blast radius: 1 file
+
+[MEDIUM]  LONG_FUNCTION      _check_classes          codewatch/rules.py
          metric=97  threshold=50
          blast radius: 2 files
 
-HEALTH SCORE: 42 / 100
+[LOW]     LONG_PARAM_LIST    _run                    codewatch/cli.py
+         metric=10  threshold=4
+
+HEALTH SCORE: 0 / 100
 
 SUMMARY (gemini-2.5-flash-lite)
-────────────────────────────────
-The codebase shows concentrated structural risk in the services layer...
+───────────────────────────────
+The codebase exhibits several high-complexity functions and deep nesting,
+particularly within codewatch/cli.py, codewatch/graph.py, and
+codewatch/review.py. These issues, along with long functions and parameter
+lists, increase the likelihood of bugs, make modifications difficult, and raise
+the effort required for future refactoring.
 
 EXPLANATIONS
 ────────────
-HIGH_COMPLEXITY · _resolve_imports
-  The function in codewatch/parse.py has a complexity of 15, significantly
-  above the threshold of 10. High complexity here makes it prone to errors
-  and difficult to maintain. Its impact on codewatch/cli.py indicates that
-  changes could affect how the CLI handles file parsing and analysis.
-```
+HIGH · HIGH_COMPLEXITY:codewatch/parse.py:_resolve_imports
+  The function has a complexity of 15, making it challenging to maintain and
+  debug. Its reliance by codewatch/cli.py means errors or changes here have a
+  broad impact, increasing refactoring effort and the potential blast radius.
 
----
+HIGH · HIGH_COMPLEXITY:codewatch/cli.py:_run
+  Complexity metric of 14 indicates this function is hard to understand and
+  prone to defects. High complexity directly impacts the core CLI execution
+  flow, making it a significant refactoring challenge.
+```
 
 ## CI/CD integration
 
@@ -135,11 +145,10 @@ HIGH_COMPLEXITY · _resolve_imports
 ```
 
 Exit codes:
-- `0` — clean, no findings at or above `--fail-on` severity
-- `1` — findings found at or above `--fail-on` severity  
-- `2` — tool error (bad path, config error) — **never** used for AI failures
 
----
+* `0` clean, no findings at or above `--fail-on` severity
+* `1` findings found at or above `--fail-on` severity
+* `2` tool error (bad path, config error), never raised for AI failures
 
 ## Configuration
 
@@ -157,9 +166,9 @@ graph:
   blast_radius_depth: 3
 
 ai:
-  provider: "anthropic"       # anthropic | openai | ollama | gemini
-  model: "claude-sonnet-4-6"
-  api_key_env: "ANTHROPIC_API_KEY"
+  provider: "gemini"
+  model: "gemini-2.5-flash-lite"
+  api_key_env: "GEMINI_API_KEY"
 
 custom_rules:
   - "controllers/* must not import from repositories/*"
@@ -170,12 +179,10 @@ custom_rules:
 
 | Provider | Config value | Key env var |
 |---|---|---|
-| Anthropic (Claude) | `anthropic` | `ANTHROPIC_API_KEY` |
-| OpenAI (GPT / o-series) | `openai` | `OPENAI_API_KEY` |
 | Google Gemini | `gemini` | `GEMINI_API_KEY` |
-| Ollama (local) | `ollama` | — |
-
----
+| Anthropic (Claude) | `anthropic` | `ANTHROPIC_API_KEY` |
+| OpenAI (GPT) | `openai` | `OPENAI_API_KEY` |
+| Ollama (local) | `ollama` | none required |
 
 ## Flags
 
@@ -186,47 +193,41 @@ custom_rules:
 --depth <int>               Blast radius BFS depth (default: 3)
 ```
 
----
-
 ## Why AI is called once, not per finding
 
 Per-finding calls cost O(N) API calls and produce redundant explanations for
 related violations. One call with all findings plus the full dependency graph
 produces better architectural synthesis, costs O(1), and enables cross-finding
-pattern recognition. Individual explanations are slightly less granular — this
+pattern recognition. Individual explanations are slightly less granular; this
 is the correct tradeoff.
-
----
 
 ## Known limitations
 
-- **Python only** — multi-language support is v2 scope
-- **Dynamic imports** — `importlib.import_module()`, `__import__()`, and plugin
-  systems are invisible to AST analysis; document this in team onboarding
-- **DUPLICATE_LOGIC reproducibility** — similarity scores near the threshold
-  (±0.02) may flip across environments due to float nondeterminism in matmul.
-  Pin `embedding_model_sha` in `config.yaml` for CI
-- **DEAD_CODE** — disabled by default; too many false positives on
-  framework-registered code (Flask routes, Celery tasks, Click commands).
+* Python only; multi-language support is planned for v2
+* Dynamic imports via `importlib.import_module()` and plugin systems are
+  invisible to AST analysis; document this in team onboarding
+* DUPLICATE_LOGIC similarity scores near the threshold (+-0.02) may flip
+  across environments due to float nondeterminism in matmul. Pin
+  `embedding_model_sha` in `config.yaml` for CI
+* DEAD_CODE is disabled by default due to false positives on framework
+  registered code such as Flask routes, Celery tasks, and Click commands.
   Enable with `dead_code: enabled: true`
-- **Custom rules** — glob matching only; a proper DSL is v2 scope
-- **Inheritance depth** — cross-file depth requires symbol resolution not
-  yet implemented; current metric counts direct base classes only
-
----
+* Custom rules use glob matching only; a proper DSL is planned for v2
+* Inheritance depth counts direct base classes only; cross-file depth
+  requires symbol resolution not yet implemented
 
 ## Project structure
 
 ```
 codewatch/
 ├── codewatch/
-│   ├── models.py     Pydantic schemas — zero logic
-│   ├── parse.py      file → FileProfile (radon + ast)
-│   ├── graph.py      FileProfile[] → nx.DiGraph, blast radius
+│   ├── models.py     Pydantic schemas, zero logic
+│   ├── parse.py      file to FileProfile (radon + ast)
+│   ├── graph.py      FileProfile list to nx.DiGraph, blast radius
 │   ├── rules.py      deterministic rule evaluation, zero AI
 │   ├── semantic.py   optional duplicate detection (local embeddings)
 │   ├── review.py     AI provider abstraction, one call per review
-│   └── cli.py        Click CLI — file | pr | repo modes
+│   └── cli.py        Click CLI, file and pr and repo modes
 ├── config.yaml
 ├── requirements.txt
 └── .env.example
