@@ -250,26 +250,25 @@ def run_review(
     AI failure produces a valid Review with empty explanations and confidence=0.0;
     the caller's exit code is based on finding severity, not AI availability.
     """
-    health_score = compute_health_score(findings)
+    health_score = compute_health_score(findings, len(profiles))
     depth = config.get("graph", {}).get("blast_radius_depth", 3)
     blast_entries = _aggregate_blast(findings, graph, depth)
     profile_map = {p.relative_path: p for p in profiles}
 
     try:
         provider = make_provider(config)
-        user_prompt, truncated = _build_user_prompt(
+        user_prompt, high_truncated = _build_user_prompt(
             mode=mode,
             health_score=health_score,
             findings=findings,
             graph=graph,
             profile_map=profile_map,
-            char_budget=int(provider.token_budget * _CHARS_PER_TOKEN),
         )
         raw = provider.complete(_SYSTEM_PROMPT, user_prompt)
         summary, explanations, confidence = _parse_ai_response(raw)
-        if truncated:
-            # Truncation means AI saw an incomplete picture — cap confidence.
-            confidence = min(confidence, 0.5)
+        if high_truncated:
+            # HIGH findings were cut — AI missed the worst issues.
+            confidence = min(confidence, 0.6)
     except Exception as exc:
         logger.error("AI call failed: %s", exc)
         print(f"AI unavailable: {exc}", file=sys.stderr)
@@ -294,131 +293,125 @@ def run_review(
 # ---------------------------------------------------------------------------
 
 
+_AI_FINDING_CAP = 30
+
+
 def _build_user_prompt(
     mode: str,
     health_score: float,
     findings: list[Finding],
     graph: nx.DiGraph,
     profile_map: dict[str, FileProfile],
-    char_budget: int,
 ) -> tuple[str, bool]:
-    """Build the AI user prompt, truncating to stay within the char budget.
+    """Build the AI user prompt, capped at the top 30 findings by priority.
 
-    Truncation is applied in this order to preserve the most signal:
-      1. Drop low-severity findings (they remain in the output, just not in AI context)
-      2. Drop blast radius context for medium findings
-      3. Drop file summaries (last resort)
-    Each truncation tier is logged to stderr and reflected in confidence.
+    Priority order:
+      1. HIGH findings, sorted by blast radius size descending.
+      2. MEDIUM findings, sorted by blast radius size descending.
+      3. LOW findings are never sent — their rule name is self-explanatory.
+
+    Returns (prompt, high_truncated) where high_truncated is True when not
+    all HIGH findings fit within the cap (worst issues unseen by the AI).
     """
-    high = [f for f in findings if f.severity == "high"]
-    medium = [f for f in findings if f.severity == "medium"]
+    def _blast_size(f: Finding) -> int:
+        return len(f.affected_nodes)
+
+    high = sorted(
+        (f for f in findings if f.severity == "high"),
+        key=_blast_size,
+        reverse=True,
+    )
+    medium = sorted(
+        (f for f in findings if f.severity == "medium"),
+        key=_blast_size,
+        reverse=True,
+    )
     low = [f for f in findings if f.severity == "low"]
 
-    def _render(
-        incl_low: bool,
-        incl_medium_context: bool,
-        incl_file_summaries: bool,
-    ) -> str:
-        shown = high + medium + (low if incl_low else [])
-        omitted_low = len(low) if not incl_low else 0
+    eligible = high + medium
+    ai_findings = eligible[:_AI_FINDING_CAP]
 
-        lines: list[str] = [
-            f"MODE: {mode}",
-            f"HEALTH SCORE: {health_score:.1f}/100",
-            "",
-            f"FINDINGS ({len(shown)} shown"
-            + (f", {omitted_low} low-severity omitted" if omitted_low else "")
-            + "):",
-        ]
+    total = len(findings)
+    shown = len(ai_findings)
+    high_truncated = len(ai_findings) < len(high)
+    omitted = total - shown
 
-        for f in shown:
-            lines.append(
-                f"[{f.severity.upper()}] {f.rule}"
-                f" | target: {f.target}"
-                f" | file: {f.file}"
-                f" | metric={f.metric_value:.3g}"
-                f" | threshold={f.threshold:.3g}"
-            )
-            show_context = f.severity == "high" or (
-                f.severity == "medium" and incl_medium_context
-            )
-            if show_context and f.affected_nodes:
-                preview = f.affected_nodes[:5]
-                extra = len(f.affected_nodes) - 5
-                lines.append(
-                    "  blast radius: "
-                    + ", ".join(preview)
-                    + (f" +{extra} more" if extra > 0 else "")
-                )
+    if high_truncated:
+        logger.warning(
+            "prompt: only %d of %d HIGH findings sent to AI — worst issues may be under-reported",
+            sum(1 for f in ai_findings if f.severity == "high"),
+            len(high),
+        )
 
-        lines += [
-            "",
-            "DEPENDENCY GRAPH:",
-            f"  nodes={graph.number_of_nodes()} edges={graph.number_of_edges()}",
-        ]
-        top5 = sorted(
-            graph.nodes, key=lambda n: graph.in_degree(n), reverse=True
-        )[:5]
-        if top5:
-            lines.append(
-                "  most depended-on: "
-                + ", ".join(f"{n} ({graph.in_degree(n)} in)" for n in top5)
-            )
-
-        if incl_file_summaries:
-            involved = sorted({f.file for f in shown})
-            if involved:
-                lines += ["", "FILE CONTEXT:"]
-            for rel in involved:
-                p = profile_map.get(rel)
-                if not p:
-                    continue
-                cls_names = [c.name for c in p.classes]
-                fn_names = [fn.name for fn in p.functions[:8]]
-                overflow = len(p.functions) - 8
-                lines.append(
-                    f"  {rel}: MI={p.maintainability_index:.1f}"
-                    + (f" classes=[{', '.join(cls_names)}]" if cls_names else "")
-                    + (
-                        f" functions=[{', '.join(fn_names)}"
-                        + ("..." if overflow > 0 else "")
-                        + "]"
-                        if fn_names
-                        else ""
-                    )
-                )
-
-        lines += [
-            "",
-            "Return one explanations entry per finding.",
-            'Key format: "RULE:target" using the exact rule and target strings above.',
-        ]
-        return "\n".join(lines)
-
-    # Attempt each truncation tier, returning on the first that fits.
-    tiers = [
-        (True, True, True),
-        (False, True, True),
-        (False, False, True),
-        (False, False, False),
+    lines: list[str] = [
+        f"MODE: {mode}",
+        f"HEALTH SCORE: {health_score:.1f}/100",
+        "",
     ]
-    messages = [
-        None,
-        "prompt truncated: %d low findings omitted from AI context",
-        "prompt truncated: low findings and medium blast-radius context omitted from AI context",
-        "prompt truncated: low findings, medium context, and file summaries omitted from AI context",
+    if omitted > 0:
+        lines.append(
+            f"Note: showing top {shown} of {total} findings by severity"
+            + (" (LOW findings omitted — self-explanatory)" if low and shown == len(eligible) else "")
+        )
+    lines.append(f"FINDINGS ({shown} shown):")
+
+    for f in ai_findings:
+        lines.append(
+            f"[{f.severity.upper()}] {f.rule}"
+            f" | target: {f.target}"
+            f" | file: {f.file}"
+            f" | metric={f.metric_value:.3g}"
+            f" | threshold={f.threshold:.3g}"
+        )
+        if f.affected_nodes:
+            preview = f.affected_nodes[:5]
+            extra = len(f.affected_nodes) - 5
+            lines.append(
+                "  blast radius: "
+                + ", ".join(preview)
+                + (f" +{extra} more" if extra > 0 else "")
+            )
+
+    lines += [
+        "",
+        "DEPENDENCY GRAPH:",
+        f"  nodes={graph.number_of_nodes()} edges={graph.number_of_edges()}",
     ]
+    top5 = sorted(graph.nodes, key=lambda n: graph.in_degree(n), reverse=True)[:5]
+    if top5:
+        lines.append(
+            "  most depended-on: "
+            + ", ".join(f"{n} ({graph.in_degree(n)} in)" for n in top5)
+        )
 
-    for i, (incl_low, incl_med_ctx, incl_file_sum) in enumerate(tiers):
-        prompt = _render(incl_low, incl_med_ctx, incl_file_sum)
-        if len(prompt) <= char_budget:
-            if i > 0 and messages[i]:
-                logger.warning(messages[i], len(low) if i == 1 else 0)
-            return prompt, i > 0
+    involved = sorted({f.file for f in ai_findings})
+    if involved:
+        lines += ["", "FILE CONTEXT:"]
+        for rel in involved:
+            p = profile_map.get(rel)
+            if not p:
+                continue
+            cls_names = [c.name for c in p.classes]
+            fn_names = [fn.name for fn in p.functions[:8]]
+            overflow = len(p.functions) - 8
+            lines.append(
+                f"  {rel}: MI={p.maintainability_index:.1f}"
+                + (f" classes=[{', '.join(cls_names)}]" if cls_names else "")
+                + (
+                    f" functions=[{', '.join(fn_names)}"
+                    + ("..." if overflow > 0 else "")
+                    + "]"
+                    if fn_names
+                    else ""
+                )
+            )
 
-    # Even the minimal prompt exceeds budget — return it anyway and truncate.
-    logger.warning("prompt exceeds token budget even after full truncation")
-    return prompt, True
+    lines += [
+        "",
+        "Return one explanations entry per finding.",
+        'Key format: "RULE:target" using the exact rule and target strings above.',
+    ]
+    return "\n".join(lines), high_truncated
 
 
 # ---------------------------------------------------------------------------

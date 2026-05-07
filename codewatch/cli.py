@@ -23,7 +23,7 @@ import click
 import networkx as nx
 from dotenv import load_dotenv
 
-from .graph import build_graph
+from .graph import build_graph, export_graph_html
 from .models import FileProfile, Finding, Review
 from .parse import parse_file
 from .review import make_provider, run_review
@@ -64,13 +64,23 @@ def review() -> None:
 @click.option("--fail-on", type=click.Choice(["high", "medium", "low"]), default=None, help="Exit 1 if any finding at or above this severity.")
 @click.option("--depth", type=int, default=None, help="Blast radius depth (overrides config).")
 @click.option("--skip-semantic", is_flag=True, help="Skip duplicate detection.")
-def review_file(path: str, output_json: bool, fail_on: str | None, depth: int | None, skip_semantic: bool) -> None:
+@click.option("--graph", "graph_flag", is_flag=True, default=False, help="Write dependency graph to codewatch_graph.html")
+def review_file(path: str, output_json: bool, fail_on: str | None, depth: int | None, skip_semantic: bool, graph_flag: bool) -> None:
     """Review a single Python file."""
     config = _load_config()
-    repo_root = os.getcwd()
+    abs_path = os.path.abspath(path)
+    # When --graph is requested, scan the whole repo so the dependency graph
+    # has full context for blast radius. Use the inferred project root so we
+    # scan FastAPI (or whatever project owns the file) rather than CWD.
+    if graph_flag:
+        repo_root = _infer_project_root(abs_path)
+        py_paths = _collect_py_files(repo_root)
+    else:
+        repo_root = os.getcwd()
+        py_paths = [abs_path]
     _run(
         mode="file",
-        py_paths=[os.path.abspath(path)],
+        py_paths=py_paths,
         repo_root=repo_root,
         config=config,
         output_json=output_json,
@@ -79,6 +89,8 @@ def review_file(path: str, output_json: bool, fail_on: str | None, depth: int | 
         depth=depth,
         use_cache=False,
         changed_files=None,
+        graph_flag=graph_flag,
+        target_file=abs_path if graph_flag else None,
     )
 
 
@@ -88,7 +100,8 @@ def review_file(path: str, output_json: bool, fail_on: str | None, depth: int | 
 @click.option("--fail-on", type=click.Choice(["high", "medium", "low"]), default=None)
 @click.option("--depth", type=int, default=None)
 @click.option("--skip-semantic", is_flag=True)
-def review_pr(diff: str, output_json: bool, fail_on: str | None, depth: int | None, skip_semantic: bool) -> None:
+@click.option("--graph", "graph_flag", is_flag=True, default=False, help="Write dependency graph to codewatch_graph.html")
+def review_pr(diff: str, output_json: bool, fail_on: str | None, depth: int | None, skip_semantic: bool, graph_flag: bool) -> None:
     """Review files changed in a unified diff.
 
     Parses the whole repo for a complete dependency graph so that blast
@@ -113,6 +126,7 @@ def review_pr(diff: str, output_json: bool, fail_on: str | None, depth: int | No
         depth=depth,
         use_cache=True,
         changed_files=set(changed_files),
+        graph_flag=graph_flag,
     )
 
 
@@ -122,11 +136,13 @@ def review_pr(diff: str, output_json: bool, fail_on: str | None, depth: int | No
 @click.option("--fail-on", type=click.Choice(["high", "medium", "low"]), default=None)
 @click.option("--depth", type=int, default=None)
 @click.option("--skip-semantic", is_flag=True)
-def review_repo(path: str, output_json: bool, fail_on: str | None, depth: int | None, skip_semantic: bool) -> None:
+@click.option("--skip-tests", is_flag=True, help="Exclude test files and test directories from analysis.")
+@click.option("--graph", "graph_flag", is_flag=True, default=False, help="Write dependency graph to codewatch_graph.html")
+def review_repo(path: str, output_json: bool, fail_on: str | None, depth: int | None, skip_semantic: bool, skip_tests: bool, graph_flag: bool) -> None:
     """Review an entire repository."""
     repo_root = os.path.abspath(path)
     config = _load_config()
-    py_paths = _collect_py_files(repo_root)
+    py_paths = _collect_py_files(repo_root, skip_tests=skip_tests)
     if not py_paths:
         click.echo(f"No Python files found in {repo_root}", err=True)
         sys.exit(2)
@@ -141,6 +157,7 @@ def review_repo(path: str, output_json: bool, fail_on: str | None, depth: int | 
         depth=depth,
         use_cache=False,
         changed_files=None,
+        graph_flag=graph_flag,
     )
 
 
@@ -160,6 +177,8 @@ def _run(
     depth: int | None,
     use_cache: bool,
     changed_files: set[str] | None,
+    graph_flag: bool = False,
+    target_file: str | None = None,
 ) -> None:
     """Execute the full analysis pipeline and print results."""
     if depth is not None:
@@ -180,13 +199,21 @@ def _run(
         click.echo("No files could be parsed.", err=True)
         sys.exit(2)
 
-    # Build dependency graph.
+    # Build dependency graph from all profiles (needed for accurate blast radius).
     graph = build_graph(profiles)
+
+    # In file mode with --graph, findings run only on the target file while the
+    # full graph is kept for blast radius and visualization.
+    if target_file is not None:
+        target_rel = os.path.relpath(target_file, repo_root)
+        analysis_profiles = [p for p in profiles if p.relative_path == target_rel]
+    else:
+        analysis_profiles = profiles
 
     # Detect structural violations.
     all_findings: list[Finding] = list(parse_findings)
     all_findings += run_rules(
-        profiles=profiles,
+        profiles=analysis_profiles,
         graph=graph,
         thresholds=thresholds,
         custom_rules=custom_rules,
@@ -231,6 +258,26 @@ def _run(
     else:
         click.echo(_format_human(rev, config, len(profiles)))
 
+    # Graph export.
+    if graph_flag:
+        try:
+            if mode == "repo":
+                export_graph_html(graph, rev.findings)
+            elif mode == "file" and profiles:
+                if target_file is not None:
+                    source_file = os.path.relpath(target_file, repo_root)
+                else:
+                    source_file = profiles[0].relative_path
+                subgraph_nodes = [source_file] + [e.node for e in rev.blast_radius]
+                export_graph_html(graph, rev.findings, subgraph_nodes=subgraph_nodes)
+            elif mode == "pr" and changed_files:
+                changed_rel = [os.path.relpath(f, repo_root) for f in changed_files]
+                blast_nodes = [e.node for e in rev.blast_radius]
+                subgraph_nodes = list(set(changed_rel) | set(blast_nodes))
+                export_graph_html(graph, rev.findings, subgraph_nodes=subgraph_nodes)
+        except Exception as e:
+            click.echo(f"warning: graph generation failed: {e}", err=True)
+
     # Exit code.
     if fail_on and _has_violation(rev.findings, fail_on):
         sys.exit(1)
@@ -242,18 +289,50 @@ def _run(
 # ---------------------------------------------------------------------------
 
 
-def _collect_py_files(root: str) -> list[str]:
+_PROJECT_MARKERS = {"setup.py", "pyproject.toml", "setup.cfg", ".git", "Pipfile"}
+
+
+def _infer_project_root(file_path: str) -> str:
+    """Walk up from file_path's directory to find the project root.
+
+    Stops at the first directory containing a known project marker.
+    Falls back to the file's parent directory if none is found.
+    """
+    directory = os.path.dirname(file_path)
+    current = directory
+    while True:
+        if any(os.path.exists(os.path.join(current, m)) for m in _PROJECT_MARKERS):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return directory
+        current = parent
+
+
+_TEST_DIRS = {"tests", "test", "testing", "e2e", "integration", "functional"}
+_TEST_FILE_PREFIXES = ("test_",)
+_TEST_FILE_SUFFIXES = ("_test.py",)
+
+
+def _collect_py_files(root: str, skip_tests: bool = False) -> list[str]:
     """Recursively collect all .py files under root, skipping hidden dirs."""
     paths: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Skip hidden directories and common non-source dirs in-place.
         dirnames[:] = [
             d for d in dirnames
-            if not d.startswith(".") and d not in ("__pycache__", "node_modules", ".venv", "venv")
+            if not d.startswith(".")
+            and d not in ("__pycache__", "node_modules", ".venv", "venv")
+            and not (skip_tests and d in _TEST_DIRS)
         ]
         for name in filenames:
-            if name.endswith(".py"):
-                paths.append(os.path.join(dirpath, name))
+            if not name.endswith(".py"):
+                continue
+            if skip_tests and (
+                any(name.startswith(p) for p in _TEST_FILE_PREFIXES)
+                or name.endswith(_TEST_FILE_SUFFIXES)
+            ):
+                continue
+            paths.append(os.path.join(dirpath, name))
     return paths
 
 

@@ -14,6 +14,7 @@ setup(
         "anthropic>=0.25",
         "openai>=1.0",
         "httpx>=0.27",
+        "pyvis>=0.3",
     ],
     entry_points={
         "console_scripts": [

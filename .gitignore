@@ -28,8 +28,10 @@ env/
 ENV/
 .python-version
 
-# codewatch runtime cache
+# codewatch runtime artifacts
 .codewatch_cache/
+codewatch_graph.html
+.gitignore
 
 # Testing & coverage
 .pytest_cache/

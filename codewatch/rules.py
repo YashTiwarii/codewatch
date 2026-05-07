@@ -74,7 +74,8 @@ def run_rules(
         findings.extend(_check_classes(profile, thresholds, br))
         findings.extend(_check_arch_violations(profile, parsed_arch_rules, br))
 
-    findings.extend(_check_circular_deps(graph))
+    profile_paths = {p.relative_path for p in profiles}
+    findings.extend(_check_circular_deps(graph, profile_paths))
 
     if dead_code_enabled:
         findings.extend(_check_dead_code(profiles, graph))
@@ -264,7 +265,7 @@ def _check_classes(
 # ---------------------------------------------------------------------------
 
 
-def _check_circular_deps(graph: nx.DiGraph) -> list[Finding]:
+def _check_circular_deps(graph: nx.DiGraph, profile_paths: set[str] | None = None) -> list[Finding]:
     """Detect runtime circular imports using networkx simple_cycles.
 
     simple_cycles finds all elementary cycles, not just one. Each unique
@@ -280,6 +281,9 @@ def _check_circular_deps(graph: nx.DiGraph) -> list[Finding]:
     seen_cycles: set[frozenset[str]] = set()
 
     for cycle in nx.simple_cycles(graph):
+        # When scoped to specific files, skip cycles that don't touch them.
+        if profile_paths is not None and not any(n in profile_paths for n in cycle):
+            continue
         key = frozenset(cycle)
         if key in seen_cycles:
             continue
@@ -426,15 +430,18 @@ def _is_entrypoint(relative_path: str) -> bool:
     return os.path.basename(relative_path) in _ENTRYPOINT_BASENAMES
 
 
-def compute_health_score(findings: list[Finding]) -> float:
-    """Compute a 0–100 health score from a list of findings.
+def compute_health_score(findings: list[Finding], total_files: int) -> float:
+    """Compute a 0–100 density-based health score.
 
-    Weights per severity: high=15, medium=5, low=2.
-    Computed here so review.py can call it before the AI call, keeping
-    the score deterministic and AI-independent.
+    raw_score = weighted_penalty / total_files_analysed
+    health_score = max(0, 100 - raw_score * 10)
+
+    Weights: HIGH=15, MEDIUM=5, LOW=1. Dividing by file count makes the
+    score comparable across repo sizes: 50 findings in 5 files is worse
+    than 50 findings in 500 files.
     """
-    penalty = sum(
-        15 if f.severity == "high" else 5 if f.severity == "medium" else 2
-        for f in findings
-    )
-    return max(0.0, 100.0 - penalty)
+    if total_files <= 0:
+        return 100.0
+    _weights = {"high": 15, "medium": 5, "low": 1}
+    raw_score = sum(_weights.get(f.severity, 0) for f in findings) / total_files
+    return max(0.0, min(100.0, 100.0 - raw_score * 10))
